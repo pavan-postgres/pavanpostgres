@@ -1,5 +1,3 @@
-
--- Author  : Tanveer Munavar
 -- Description : scripts to run from a psql session
 -- script deployment location `touch ~/.psqlrc`
 -- usage : `postgres=> :vacuum_queries`
