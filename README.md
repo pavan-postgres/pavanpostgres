@@ -1,6 +1,6 @@
 - 👋 Hi, I’m @pavanteja
-- 👀 I’m interested in Database Administration 
-- 🌱 I’m currently exploring / refactoring PostgreSQL
+- 👀 I’m interested in Database Engineering / Automation 
+- 🌱 I’m currently exploring / refactoring PostgreSQL and other services of AWS
 - 💞️ I’m looking to collaborate on Postgres,AWS,Kubernetes,Docker,Terraform,Jenkins
 - 📫 How to reach me pavan.postgresdba@gmail.com
 
