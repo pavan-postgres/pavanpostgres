@@ -1,0 +1,12 @@
+use_iam: "false"
+db_instance_identifiers:
+ - rds-1-logical-publisher
+ - rds-2-logical-subscriber
+ - rds-3-logical-publisher-subscriber
+ - rds-4-cdc-logical-publisher-subscriber
+new_engine_version: "15.6"
+new_engine_family: "postgres15"
+new_template_db_parameter_group_name: "postgres-template-15"
+region_name: "ap-south-1"
+parameter_group_backup_path: "/tmp"
+metis_cdc_base_url: "https://cdc-metis.internal.zone-1.domain.com"
