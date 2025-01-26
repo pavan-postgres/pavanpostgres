@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #==========================================================================================
-# Author : Pavanteja ASSR (pavantejaa@zeta.tech)
+# Author : Pavanteja ASSR 
 # Description : script to enforce retention policy for rds log groups
 # Usage
 #==========================================================================================

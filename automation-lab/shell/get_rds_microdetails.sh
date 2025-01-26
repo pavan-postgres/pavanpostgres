@@ -8,8 +8,7 @@
 # script to get the RDS instance allocated storage, clustersize_fromDB, database and its size, fully qualified tablename(schemaname.tablename) and its sizes
 
 # usage :
-# git clone git@bitbucket.org:zetaengg/database-engineering.git
-# cd database-engineering/dbe-tech/bash
+# git clone git@bitbucket.org:repo.git
 # sh get_rds_allocated_storage_db_n_table_sizes.sh
 
 # documentation :
