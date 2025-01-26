@@ -1,9 +1,0 @@
-# exclude config files with sensitive keyword name
-# zone-2.sensitive.yaml file has sensitive information
-
-*.sensitive.config
-*.sen*.yml
-*.sensitive.*
-*.sensit*.*
-*.s*itive.*
-*.yml
