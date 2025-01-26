@@ -1,0 +1,6 @@
+tmux new-session -s <somename>
+ctrl + b
+d
+tmux ls
+tmux a -t <name>
+
