@@ -65,8 +65,8 @@ dag = DAG(
 
 # List of RDS instances and their respective instance classes
 rds_instance_details = {
-    'pp-data-orcus': 'db.t4g.medium'
-#    'preprod-ofac-db': 'db.t4g.small'
+    'rds-1': 'db.t4g.medium'
+#    'rds-2': 'db.t4g.small'
     # Add more instances and classes here
 }
 
