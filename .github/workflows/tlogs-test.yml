@@ -1,0 +1,31 @@
+# Lives at <repo root>/.github/workflows/ ; tests the tlogs/ folder.
+name: tlogs tests
+on:
+  push:
+    paths: ['tlogs/**', '.github/workflows/tlogs-test.yml']
+  pull_request:
+    paths: ['tlogs/**', '.github/workflows/tlogs-test.yml']
+  workflow_dispatch:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: tlogs
+    steps:
+      - uses: actions/checkout@v4
+      - name: install tmux
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install tmux; else sudo apt-get update && sudo apt-get install -y tmux shellcheck; fi
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck -S warning tlogs install.sh tests/test.sh
+      - name: tests (default bash)
+        run: bash tests/test.sh
+      - name: tests (macOS system bash 3.2)
+        if: runner.os == 'macOS'
+        run: SH=/bin/bash /bin/bash tests/test.sh
