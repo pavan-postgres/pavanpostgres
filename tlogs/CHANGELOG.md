@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.1.2
+- Pane labels always keep their state colour (a FAILED pane stays red when you select it); the active pane is marked with `>`.
+- README: animated demo (`docs/demo.gif`), recorded from a real tlogs run.
+
 ## 2.1.1
 - The watch window's pane is titled `tl-watch` (was the host name).
 - Status bar shows the full session name instead of cutting it at 10 characters.

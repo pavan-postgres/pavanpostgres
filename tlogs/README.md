@@ -6,9 +6,9 @@
 cd /var/log/batch && tlogs -rw
 ```
 
-![tlogs showing four log panes: an amber WARN pane, a blue RUNNING pane that appeared on its own, a red FAILED pane, and the active pane in yellow](docs/screenshot.png)
+![tlogs: four job logs open in tmux panes, a new log gets its own pane, a failed job is zoomed, and a clean finish closes itself](docs/demo.gif)
 
-*Label colours: blue = running, green = done (closes itself in watch mode), amber = warn, red = failed, yellow = the pane you're on.*
+*Label colours: blue = running, green = done (closes itself in watch mode), amber = warn, red = failed. `>` marks the pane you're on.*
 
 It's one bash script on top of tmux. Nothing runs on your servers except `tail`, and there's no agent, daemon or database.
 

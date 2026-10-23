@@ -3,7 +3,7 @@
 #         live state per log (RUNNING / DONE / WARN / FAILED).
 # Needs: bash 3.2+, tmux 3.0+, tail, grep.   Works on macOS, Linux, WSL, EC2.
 # Docs:  tlogs help        License: MIT
-TL_VERSION=2.1.1
+TL_VERSION=2.1.2
 
 # ---------------------------------------------------------------- settings ---
 # Every setting can come from (highest wins):
@@ -145,7 +145,7 @@ tl_colorize() {
 }
 
 # ------------------------------------------------------------ tmux panes ---
-TL_FMT='#{?pane_active,#[bg=yellow#,fg=black#,bold],#{?#{==:#{@st},FAILED},#[bg=red#,fg=white#,bold],#{?#{==:#{@st},WARN},#[bg=colour214#,fg=black#,bold],#{?#{==:#{@st},DONE},#[bg=green#,fg=black#,bold],#[bg=blue#,fg=white#,bold]}}}} #{pane_index}: #{pane_title}#{?#{@st}, [#{@st}],} #[default]'
+TL_FMT='#{?#{==:#{@st},FAILED},#[bg=red#,fg=white#,bold],#{?#{==:#{@st},WARN},#[bg=colour214#,fg=black#,bold],#{?#{==:#{@st},DONE},#[bg=green#,fg=black#,bold],#[bg=blue#,fg=white#,bold]}}} #{?pane_active,> ,}#{pane_index}: #{pane_title}#{?#{@st}, [#{@st}],} #[default]'
 
 tl_pane_cmd() {   # command a pane runs for one file
   printf 'exec %q _pane %q %q' "$TL_SELF" "$TL_SESSION_CONF" "$1"
@@ -181,7 +181,7 @@ tlogs $TL_VERSION - watch a folder of logs in tmux
   tlogs config                show the settings in effect here
   tlogs version
 
-Pane labels: blue running, green DONE, amber WARN, red FAILED, yellow = pane you are on.
+Pane labels: blue running, green DONE, amber WARN, red FAILED; '>' marks the pane you are on.
 In tmux: Ctrl-b z zoom a pane (again to unzoom), Ctrl-b d detach, Ctrl-b arrows move.
 Mouse (TL_MOUSE=1): click a pane, scroll to read back, drag borders, right-click for a menu.
 To copy text with the mouse on: hold Option (iTerm2) or Fn (Terminal.app) while dragging.
