@@ -3,7 +3,7 @@
 #         live state per log (RUNNING / DONE / WARN / FAILED).
 # Needs: bash 3.2+, tmux 3.0+, tail, grep.   Works on macOS, Linux, WSL, EC2.
 # Docs:  tlogs help        License: MIT
-TL_VERSION=2.1.2
+TL_VERSION=2.1.3
 
 # ---------------------------------------------------------------- settings ---
 # Every setting can come from (highest wins):
@@ -173,7 +173,7 @@ tlogs $TL_VERSION - watch a folder of logs in tmux
     -c FILE     extra config file (see: tlogs init)
     -n NAME     tmux session name (default: tlogs-<folder>)
 
-  tlogs color [FILE]          colour a file (follows it) or stdin:  tail -f x.log | tlogs color
+  tlogs color [-c FILE] [LOG]  colour a log (follows it) or stdin:  tail -f x.log | tlogs color -c pg.conf
   tlogs ls                    list tmux sessions
   tlogs attach NAME           re-attach to a session
   tlogs kill NAME             close a session (asks twice; log files are never touched)
@@ -392,18 +392,32 @@ EOF
 }
 
 # ---------------------------------------------------------------- dispatch ---
+# "-c FILE" may also come before a subcommand: tlogs -c pg.conf color x.log
+TL_PRE_CONF=""
+case "${1:-}:${3:-}" in
+  -c:color|-c:colour|-c:config|--config:color|--config:colour|--config:config) TL_PRE_CONF="${2:-}"; shift 2 ;;
+esac
+
 case "${1:-}" in
   _pane)   shift; tl_pane "$@" ;;
   _watch)  shift; tl_watch "$@" ;;
   color|colour)
-    shift; tl_config
-    if [ -n "${1:-}" ]; then tail -n "$TL_HISTORY" -F "$1" | tl_colorize; else tl_colorize; fi ;;
+    shift; conf="$TL_PRE_CONF"
+    while [ $# -gt 0 ]; do
+      case "$1" in -c|--config) shift; conf="${1:-}" ;; --) shift; break ;; *) break ;; esac; shift
+    done
+    if [ -n "$conf" ] && [ ! -f "$conf" ]; then die "no such config: $conf"; fi
+    tl_config "$conf"
+    if [ -n "${1:-}" ]; then
+      [ -r "$1" ] || die "cannot read: $1"
+      tail -n "$TL_HISTORY" -F "$1" | tl_colorize
+    else tl_colorize; fi ;;
   ls)      tmux ls 2>/dev/null || echo "no tmux sessions" ;;
   attach)  shift; [ -n "${1:-}" ] || { tmux ls 2>/dev/null; die "usage: tlogs attach NAME"; }
            tmux has-session -t "=$1" 2>/dev/null || die "no session named exactly '$1'"; tl_attach "$1" ;;
   kill)    shift; tl_kill "${1:-}" ;;
   init)    tl_init ;;
-  config)  shift; tl_config "${1:-}"; tl_dump ;;
+  config)  shift; tl_config "${TL_PRE_CONF:-${1:-}}"; tl_dump ;;
   version|--version) echo "tlogs $TL_VERSION" ;;
   help)    tl_config; usage ;;
   *)       tl_main "$@" ;;

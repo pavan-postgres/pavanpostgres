@@ -84,6 +84,7 @@ tlogs attach NAME        # back into a session (after a dropped connection, too)
 tlogs kill NAME          # close a session; asks twice, never touches log files
 tlogs color FILE         # just colour one file, no tmux:  tlogs color app.log
 tail -f x.log | tlogs color
+tlogs color -c examples/postgres-server.conf x.log   # with a preset
 tlogs config             # the settings in effect in this folder
 ```
 
@@ -261,7 +262,7 @@ tail -f /var/log/postgresql/postgresql-16-main.log | tlogs color
 ## Test
 
 ```bash
-bash tests/test.sh          # 38 checks: colours, states, config safety, tmux panes, mouse scope, watch mode
+bash tests/test.sh          # 41 checks: colours, states, config safety, tmux panes, mouse scope, watch mode
 ```
 CI runs the same tests on Ubuntu and on macOS, including macOS's built-in bash 3.2.
 

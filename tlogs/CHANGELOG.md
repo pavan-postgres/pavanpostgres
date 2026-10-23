@@ -1,5 +1,8 @@
 # Changelog
 
+## 2.1.3
+- `tlogs color` accepts a config: `tlogs color -c pg.conf x.log` or `tlogs -c pg.conf color x.log` (found by a fresh-install test).
+
 ## 2.1.2
 - Pane labels always keep their state colour (a FAILED pane stays red when you select it); the active pane is marked with `>`.
 - README: animated demo (`docs/demo.gif`), recorded from a real tlogs run.

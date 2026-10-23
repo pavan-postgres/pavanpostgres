@@ -25,6 +25,11 @@ check "user rule"       "$(printf 'disk 91%%\n' | TL_RED_RE='disk 9[0-9]%' "$SH"
 check "rule off"        "$(printf 'x ERROR: y\n' | TL_RED_RE='' "$SH" "$T" color)" "x ERROR: y"
 check "icase"           "$(printf 'oops error\n' | TL_ICASE=1 TL_RED_RE='ERROR' "$SH" "$T" color)" "${ESC}[1;31moops error${ESC}[0m"
 check "NO_COLOR"        "$(printf 'x ERROR: y\n' | NO_COLOR=1 "$SH" "$T" color)" "x ERROR: y"
+printf 'TL_RED_RE=BOOM\n' > p.conf
+check "color -c FILE"   "$(printf 'x BOOM y\n' | "$SH" "$T" color -c p.conf)" "${ESC}[1;31mx BOOM y${ESC}[0m"
+check "-c FILE color"   "$(printf 'x BOOM y\n' | "$SH" "$T" -c p.conf color)" "${ESC}[1;31mx BOOM y${ESC}[0m"
+check "color bad config" "$(printf 'x\n' | "$SH" "$T" color -c nope.conf 2>&1)" "tlogs: no such config: nope.conf"
+rm -f p.conf
 check "special chars"   "$(printf 'a & b \\ c ERROR: d\n' | TL_HIGHLIGHT=word "$SH" "$T" color)" "a & b \\ c ${ESC}[1;31mERROR:${ESC}[0m d"
 
 # --- states
