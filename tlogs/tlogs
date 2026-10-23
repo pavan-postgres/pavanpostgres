@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# tlogs - watch a folder of log files in tmux: one pane per log, coloured lines,
+#         live state per log (RUNNING / DONE / WARN / FAILED).
+# Needs: bash 3.2+, tmux 3.0+, tail, grep.   Works on macOS, Linux, WSL, EC2.
+# Docs:  tlogs help        License: MIT
+TL_VERSION=2.1.2
+
+# ---------------------------------------------------------------- settings ---
+# Every setting can come from (highest wins):
+#   1. environment variable          TL_RED_RE='ERROR' tlogs
+#   2. -c FILE                        tlogs -c ~/pg.conf
+#   3. .tlogs.conf in the log folder
+#   4. ~/.config/tlogs/config         (tlogs init writes a commented one)
+#   5. the defaults below (tuned for PostgreSQL server logs and pg_upgrade)
+TL_KEYS="TL_GLOB TL_PREFIX TL_HISTORY TL_ICASE TL_HIGHLIGHT TL_NO_COLOR
+TL_RED_RE TL_AMBER_RE TL_YELLOW_RE TL_GREEN_RE TL_BLUE_RE TL_DIM_RE
+TL_OK_RE TL_WARN_RE TL_FAIL_RE TL_TAIL_LINES TL_WATCH_SEC TL_DONE_GRACE TL_KEEP_DONE TL_MOUSE"
+
+tl_defaults() {
+  : "${TL_GLOB:=*.log}"          # which files; space-separated globs, e.g. '*.log *.out'
+  : "${TL_PREFIX:=}"             # common prefix trimmed from pane labels
+  : "${TL_HISTORY:=50}"          # lines of history each pane starts with
+  : "${TL_ICASE:=0}"             # 1 = all patterns are case-insensitive
+  : "${TL_HIGHLIGHT:=line}"      # line = colour the whole line, word = colour only the match
+  : "${TL_NO_COLOR:=${NO_COLOR:+1}}"; : "${TL_NO_COLOR:=0}"
+  # line colours: extended regex; first match wins in this order. Empty = rule off.
+  : "${TL_RED_RE=PANIC:|FATAL:|ERROR:|Failure, exiting|[Ee]xception|Traceback|[Aa]borted|FAILED}"
+  : "${TL_AMBER_RE=WARNING:|WARN}"
+  : "${TL_YELLOW_RE=NOTICE:|HINT:}"
+  : "${TL_GREEN_RE=Upgrade Complete|completed successfully|finished successfully|SUCCESS}"
+  : "${TL_BLUE_RE=}"
+  : "${TL_DIM_RE=DEBUG[1-5]?:|STATEMENT:|CONTEXT:}"
+  # log state, from the last TL_TAIL_LINES lines (only meaningful for logs that end)
+  : "${TL_OK_RE=Upgrade Complete|completed successfully|finished successfully}"
+  : "${TL_FAIL_RE=Failure, exiting|PANIC:|FATAL:|[Aa]borted|Traceback}"
+  : "${TL_WARN_RE=WARNING:}"     # searched in the whole log, only once it is OK -> WARN
+  : "${TL_TAIL_LINES:=10}"
+  : "${TL_WATCH_SEC:=15}"        # -w: how often to look for new / finished logs
+  : "${TL_DONE_GRACE:=60}"       # -w: seconds a DONE pane stays before it closes
+  : "${TL_KEEP_DONE:=0}"         # -w: 1 = never close panes
+  : "${TL_MOUSE:=1}"             # 1 = mouse on in tlogs sessions only (click a pane, scroll); 0 = keyboard only
+}
+
+# Config files are parsed, never executed: only KEY=VALUE lines with known TL_ keys.
+tl_load() {
+  local file="$1" line k v
+  [ -f "$file" ] && [ -r "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"            # trim leading space
+    case "$line" in ''|'#'*) continue ;; esac
+    line="${line#export }"
+    k="${line%%=*}"; v="${line#*=}"
+    [ "$k" != "$line" ] || continue
+    case " $(echo $TL_KEYS) " in *" $k "*) ;; *) echo "tlogs: ignoring unknown key '$k' in $file" >&2; continue ;; esac
+    case " $TL_ENV_KEYS " in *" $k "*) continue ;; esac   # environment wins
+    v="${v%"${v##*[![:space:]]}"}"                       # trim trailing space
+    if [ ${#v} -ge 2 ]; then
+      case "$v" in \'*\') v="${v:1:${#v}-2}" ;; \"*\") v="${v:1:${#v}-2}" ;; esac
+    fi
+    printf -v "$k" '%s' "$v"
+  done < "$file"
+}
+
+tl_config() {   # tl_config [explicit-file]
+  TL_ENV_KEYS=""
+  local k; for k in $TL_KEYS; do [ -n "${!k+x}" ] && TL_ENV_KEYS="$TL_ENV_KEYS $k"; done
+  # later files override earlier ones, so load lowest priority first
+  tl_load "${XDG_CONFIG_HOME:-$HOME/.config}/tlogs/config"
+  tl_load "./.tlogs.conf"
+  [ -n "${1:-}" ] && tl_load "$1"
+  tl_defaults
+}
+
+tl_dump() { local k; for k in $TL_KEYS; do printf '%s=%s\n' "$k" "${!k}"; done; }
+
+# ---------------------------------------------------------------- helpers ---
+C_RED=$'\033[1;31m'; C_AMBER=$'\033[38;5;214m'; C_YELLOW=$'\033[33m'; C_GREEN=$'\033[32m'
+C_BLUE=$'\033[36m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+
+die() { echo "tlogs: $*" >&2; exit 1; }
+
+tl_self() {   # absolute path of this script, for the commands tmux runs
+  case "$0" in /*) printf '%s' "$0" ;; */*) printf '%s/%s' "$(cd "${0%/*}" && pwd)" "${0##*/}" ;; *) command -v "$0" ;; esac
+}
+
+tl_need_tmux() {
+  command -v tmux >/dev/null 2>&1 || die "tmux not found - install it first (see: tlogs help)"
+  local v; v=$(tmux -V 2>/dev/null); v=${v#* }; v=${v%%[!0-9.]*}
+  [ "${v%%.*}" -ge 3 ] 2>/dev/null || die "tmux 3.0+ needed (found ${v:-unknown}) - see 'Older systems' in the README"
+}
+
+tl_grep() {   # tl_grep REGEX  (stdin)  - honours TL_ICASE, empty regex never matches
+  [ -n "$1" ] || return 1
+  if [ "$TL_ICASE" = 1 ]; then grep -Eqi -- "$1"; else grep -Eq -- "$1"; fi
+}
+
+# state of one log: DONE | WARN | FAILED | RUNNING
+tl_state() {
+  local f="$1" t
+  t=$(tail -n "$TL_TAIL_LINES" "$f" 2>/dev/null)
+  if printf '%s\n' "$t" | tl_grep "$TL_OK_RE"; then
+    if tl_grep "$TL_WARN_RE" < "$f"; then echo WARN; else echo DONE; fi
+  elif printf '%s\n' "$t" | tl_grep "$TL_FAIL_RE"; then echo FAILED
+  else echo RUNNING; fi
+}
+
+tl_files() {   # prints matching files, one per line, sorted, unique
+  local g f seen=$'\n'
+  local ng; ng=$(shopt -p nullglob); shopt -s nullglob
+  local globs; set -f                       # split the pattern list without expanding it yet
+  # shellcheck disable=SC2206
+  globs=($TL_GLOB); set +f
+  for g in "${globs[@]}"; do
+    for f in $g; do
+      [ -f "$f" ] || continue
+      case "$seen" in *$'\n'"$f"$'\n'*) continue ;; esac
+      seen="$seen$f"$'\n'; printf '%s\n' "$f"
+    done
+  done | LC_ALL=C sort
+  eval "$ng"
+}
+
+tl_label() { printf '%s' "${1#"$TL_PREFIX"}"; }
+
+# colour stdin line by line using the TL_*_RE rules (pure bash, unbuffered)
+tl_colorize() {
+  local line c m pre post
+  if [ "$TL_NO_COLOR" = 1 ]; then cat; return; fi
+  [ "$TL_ICASE" = 1 ] && shopt -s nocasematch
+  while IFS= read -r line || [ -n "$line" ]; do
+    c=""
+    if   [ -n "$TL_RED_RE" ]    && [[ $line =~ $TL_RED_RE ]];    then c=$C_RED
+    elif [ -n "$TL_AMBER_RE" ]  && [[ $line =~ $TL_AMBER_RE ]];  then c=$C_AMBER
+    elif [ -n "$TL_YELLOW_RE" ] && [[ $line =~ $TL_YELLOW_RE ]]; then c=$C_YELLOW
+    elif [ -n "$TL_GREEN_RE" ]  && [[ $line =~ $TL_GREEN_RE ]];  then c=$C_GREEN
+    elif [ -n "$TL_BLUE_RE" ]   && [[ $line =~ $TL_BLUE_RE ]];   then c=$C_BLUE
+    elif [ -n "$TL_DIM_RE" ]    && [[ $line =~ $TL_DIM_RE ]];    then c=$C_DIM
+    fi
+    if [ -z "$c" ]; then printf '%s\n' "$line"
+    elif [ "$TL_HIGHLIGHT" = word ] && [ -n "${BASH_REMATCH[0]}" ]; then
+      m=${BASH_REMATCH[0]}; pre=${line%%"$m"*}; post=${line#*"$m"}
+      printf '%s%s%s%s%s\n' "$pre" "$c" "$m" "$C_OFF" "$post"
+    else printf '%s%s%s\n' "$c" "$line" "$C_OFF"; fi
+  done
+}
+
+# ------------------------------------------------------------ tmux panes ---
+TL_FMT='#{?#{==:#{@st},FAILED},#[bg=red#,fg=white#,bold],#{?#{==:#{@st},WARN},#[bg=colour214#,fg=black#,bold],#{?#{==:#{@st},DONE},#[bg=green#,fg=black#,bold],#[bg=blue#,fg=white#,bold]}}} #{?pane_active,> ,}#{pane_index}: #{pane_title}#{?#{@st}, [#{@st}],} #[default]'
+
+tl_pane_cmd() {   # command a pane runs for one file
+  printf 'exec %q _pane %q %q' "$TL_SELF" "$TL_SESSION_CONF" "$1"
+}
+
+tl_mark() { tmux set -p -t "$1" @st "$2" >/dev/null 2>&1; tmux set -p -t "$1" @tl_file "$3" >/dev/null 2>&1; }
+
+tl_attach() {
+  local s="$1"
+  if [ -n "${TMUX:-}" ]; then tmux switch-client -t "=$s"
+  elif [ -t 0 ] && [ -t 1 ] && [ "${TL_NO_ATTACH:-0}" != 1 ]; then tmux attach -t "=$s"
+  else echo "session '$s' is ready: tmux attach -t '$s'"; fi
+}
+
+usage() {
+  cat <<EOF
+tlogs $TL_VERSION - watch a folder of logs in tmux
+
+  tlogs [options] [DIR]       one pane per log in DIR (default: current folder)
+    -r          only logs still RUNNING
+    -e          only logs that need a look (FAILED or WARN)
+    -w          watch: add panes for new logs, close DONE panes after TL_DONE_GRACE s
+    -l          list each log's state and exit (no tmux needed)
+    -g GLOB     which files, e.g. -g 'postgresql-*.log' (default '$TL_GLOB')
+    -c FILE     extra config file (see: tlogs init)
+    -n NAME     tmux session name (default: tlogs-<folder>)
+
+  tlogs color [FILE]          colour a file (follows it) or stdin:  tail -f x.log | tlogs color
+  tlogs ls                    list tmux sessions
+  tlogs attach NAME           re-attach to a session
+  tlogs kill NAME             close a session (asks twice; log files are never touched)
+  tlogs init                  write a commented config to ~/.config/tlogs/config
+  tlogs config                show the settings in effect here
+  tlogs version
+
+Pane labels: blue running, green DONE, amber WARN, red FAILED; '>' marks the pane you are on.
+In tmux: Ctrl-b z zoom a pane (again to unzoom), Ctrl-b d detach, Ctrl-b arrows move.
+Mouse (TL_MOUSE=1): click a pane, scroll to read back, drag borders, right-click for a menu.
+To copy text with the mouse on: hold Option (iTerm2) or Fn (Terminal.app) while dragging.
+EOF
+}
+
+tl_main() {
+  local mode=all watch=0 conf="" name="" dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -r|--running) mode=running ;;
+      -e|--issues)  mode=issues ;;
+      -w|--watch)   watch=1 ;;
+      -rw|-wr)      mode=running; watch=1 ;;
+      -ew|-we)      mode=issues; watch=1 ;;
+      -l|--list)    mode=list ;;
+      -g|--glob)    shift; [ $# -gt 0 ] || die "-g needs a value"; TL_GLOB="$1" ;;
+      -c|--config)  shift; [ $# -gt 0 ] || die "-c needs a file"; [ -f "$1" ] || die "no such config: $1"; conf="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")" ;;
+      -n|--name)    shift; [ $# -gt 0 ] || die "-n needs a name"; name="$1" ;;
+      -h|--help)    tl_config; usage; exit 0 ;;
+      -*)           die "unknown option: $1 (see: tlogs help)" ;;
+      *)            [ -z "$dir" ] || die "only one folder at a time"; dir="$1" ;;
+    esac; shift
+  done
+  if [ -n "$dir" ]; then cd "$dir" || die "cannot open folder: $dir"; fi
+  tl_config "$conf"
+
+  local files=() f st n_run=0 n_ok=0 n_warn=0 n_fail=0 total=0 col
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue; total=$((total+1))
+    st=$(tl_state "$f")
+    case "$st" in RUNNING) n_run=$((n_run+1)) ;; DONE) n_ok=$((n_ok+1)) ;; WARN) n_warn=$((n_warn+1)) ;; FAILED) n_fail=$((n_fail+1)) ;; esac
+    if [ "$mode" = list ]; then
+      case "$st" in RUNNING) col=$C_BLUE ;; DONE) col=$C_GREEN ;; WARN) col=$C_AMBER ;; FAILED) col=$C_RED ;; esac
+      [ "$TL_NO_COLOR" = 1 ] || [ ! -t 1 ] && col=""
+      printf '%s%-8s%s %s\n' "$col" "$st" "${col:+$C_OFF}" "$(tl_label "$f")"
+    fi
+    case "$mode:$st" in all:*|running:RUNNING|issues:FAILED|issues:WARN) files+=("$f") ;; esac
+  done < <(tl_files)
+  [ "$total" -gt 0 ] || [ "$watch" = 1 ] || die "no files matching '$TL_GLOB' in $PWD"
+  echo "running: $n_run  done: $n_ok  warn: $n_warn  failed: $n_fail  (of $total)"
+  [ "$mode" = list ] && exit 0
+
+  tl_need_tmux
+  if [ ${#files[@]} -eq 0 ] && [ "$watch" = 0 ]; then
+    [ "$mode" = issues ] && echo "nothing FAILED or WARN here" || echo "nothing running here"; exit 0
+  fi
+  local s="${name:-tlogs-${PWD##*/}}"
+  [ -z "$name" ] && case "$mode" in running) s="$s-running" ;; issues) s="$s-issues" ;; esac
+  s=$(printf '%s' "$s" | tr -c 'A-Za-z0-9_-' '_')
+  if tmux has-session -t "=$s" 2>/dev/null; then
+    echo "session '$s' already exists - attaching (to rebuild it: tlogs kill $s, then run again)"; tl_attach "$s"; exit 0
+  fi
+
+  # snapshot of the settings for the panes and the watcher
+  TL_SELF=$(tl_self)
+  local rt="${TMPDIR:-/tmp}"; rt="${rt%/}/tlogs-$(id -u)"
+  mkdir -p "$rt" && chmod 700 "$rt" || die "cannot create $rt"
+  TL_SESSION_CONF="$rt/$s.conf"; tl_dump > "$TL_SESSION_CONF"
+
+  local cols lines pid first=1
+  cols=$(tput cols 2>/dev/null || echo 200); lines=$(tput lines 2>/dev/null || echo 50)
+  if [ ${#files[@]} -eq 0 ]; then
+    pid=$(tmux new-session -d -P -F '#{pane_id}' -s "$s" -x "$cols" -y "$lines" -c "$PWD" \
+          "echo 'tl-waiting: no matching logs yet in $PWD - new ones will appear here'; exec tail -f /dev/null") || die "could not start tmux"
+    tmux select-pane -t "$pid" -T "waiting for new logs"; tmux set -p -t "$pid" @tl_wait 1; first=0
+  fi
+  for f in "${files[@]}"; do
+    if [ $first = 1 ]; then
+      pid=$(tmux new-session -d -P -F '#{pane_id}' -s "$s" -x "$cols" -y "$lines" -c "$PWD" "$(tl_pane_cmd "$f")") || die "could not start tmux"; first=0
+    else
+      pid=$(tmux split-window -P -F '#{pane_id}' -t "=$s:" -c "$PWD" "$(tl_pane_cmd "$f")") || { echo "no room for another pane: $f (make the terminal bigger, or use -r / -e)"; continue; }
+      tmux select-layout -t "=$s:" tiled >/dev/null
+    fi
+    tmux select-pane -t "$pid" -T "$(tl_label "$f")"; tl_mark "$pid" "$(tl_state "$f")" "$f"
+  done
+  tmux rename-window -t "=$s:" logs >/dev/null 2>&1
+  tmux set -w -t "=$s:" automatic-rename off >/dev/null 2>&1
+  tmux set -w -t "=$s:" pane-border-status top >/dev/null
+  tmux set -w -t "=$s:" pane-border-format "$TL_FMT" >/dev/null
+  tmux set -w -t "=$s:" remain-on-exit off >/dev/null
+  # mouse: session option, so other tmux sessions and ~/.tmux.conf are not affected
+  tmux set -t "=$s:" status-left-length $(( ${#s} + 4 )) >/dev/null   # show the full session name
+  if [ "$TL_MOUSE" = 1 ]; then tmux set -t "=$s:" mouse on >/dev/null; else tmux set -t "=$s:" mouse off >/dev/null; fi
+  if [ "$watch" = 1 ]; then
+    local wid; wid=$(tmux display -p -t "=$s:" '#{window_id}')
+    local wpid
+    wpid=$(tmux new-window -d -P -F '#{pane_id}' -t "=$s:" -n tl-watch -c "$PWD" \
+      "$(printf 'exec %q _watch %q %q %q' "$TL_SELF" "$TL_SESSION_CONF" "$wid" "$mode")") \
+      && tmux select-pane -t "$wpid" -T tl-watch \
+      && echo "watching every ${TL_WATCH_SEC}s - window 'tl-watch' (Ctrl-b n) shows what changed"
+  fi
+  echo "session '$s': ${#files[@]} panes"
+  tl_attach "$s"
+}
+
+# runs inside each pane
+tl_pane() {
+  tl_load "$1"; tl_defaults
+  tail -n "$TL_HISTORY" -F "$2" 2>/dev/null | tl_colorize
+}
+
+# runs in the tl-watch window for -w
+tl_watch() {
+  tl_load "$1"; tl_defaults; TL_SESSION_CONF="$1"; TL_SELF=$(tl_self)
+  local wid="$2" mode="$3" f have pid act st now n flist done_at=" " entry since
+  echo "tl-watch: $PWD every ${TL_WATCH_SEC}s (mode: $mode). Stops when the session closes."
+  [ "$TL_KEEP_DONE" = 1 ] || echo "tl-watch: DONE panes close ${TL_DONE_GRACE}s after finishing; FAILED and WARN stay."
+  while tmux list-panes -t "$wid" >/dev/null 2>&1; do
+    sleep "$TL_WATCH_SEC"
+    have=$(tmux list-panes -t "$wid" -F '#{@tl_file}' 2>/dev/null) || break
+    have=$'\n'"$have"$'\n'
+    # 1. new logs
+    flist=$(tl_files)
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      case "$have" in *$'\n'"$f"$'\n'*) continue ;; esac
+      st=$(tl_state "$f")
+      case "$mode:$st" in all:*|running:RUNNING|issues:FAILED|issues:WARN) ;; *) continue ;; esac
+      act=$(tmux display -p -t "$wid" '#{pane_id}')
+      pid=$(tmux split-window -d -P -F '#{pane_id}' -t "$wid" -c "$PWD" "$(tl_pane_cmd "$f")" 2>/dev/null) \
+        || { echo "$(date +%T) no room for $f"; continue; }
+      tmux select-layout -t "$wid" tiled >/dev/null
+      tmux select-pane -t "$pid" -T "$(tl_label "$f")"; tmux select-pane -t "$act"; tl_mark "$pid" "$st" "$f"
+      have="$have$f"$'\n'; echo "$(date +%T) added   $f"
+    done <<EOF
+$flist
+EOF
+    # 2. refresh states, drop the placeholder, close DONE panes after the grace period
+    now=$(date +%s)
+    while IFS='|' read -r pid w f; do
+      if [ "$w" = 1 ]; then
+        n=$(( $(tmux list-panes -t "$wid" 2>/dev/null | wc -l) ))
+        [ "$n" -gt 1 ] && tmux kill-pane -t "$pid" && tmux select-layout -t "$wid" tiled >/dev/null
+        continue
+      fi
+      [ -n "$f" ] && [ -e "$f" ] || continue
+      st=$(tl_state "$f"); tmux set -p -t "$pid" @st "$st" >/dev/null 2>&1
+      [ "$TL_KEEP_DONE" = 1 ] && continue
+      entry=" $pid:"
+      if [ "$st" != DONE ]; then done_at=$(printf '%s' "$done_at" | sed "s/ $pid:[0-9]*//"); continue; fi
+      case "$done_at" in *"$entry"*) ;; *) done_at="$done_at$pid:$now "; continue ;; esac
+      since=${done_at#*"$entry"}; since=${since%% *}
+      [ $((now - since)) -ge "$TL_DONE_GRACE" ] || continue
+      n=$(( $(tmux list-panes -t "$wid" 2>/dev/null | wc -l) )); [ "$n" -gt 1 ] || continue
+      tmux kill-pane -t "$pid" && tmux select-layout -t "$wid" tiled >/dev/null
+      done_at=$(printf '%s' "$done_at" | sed "s/ $pid:[0-9]*//")
+      echo "$(date +%T) closed  $f (DONE)"
+    done <<EOF
+$(tmux list-panes -t "$wid" -F '#{pane_id}|#{@tl_wait}|#{@tl_file}' 2>/dev/null)
+EOF
+  done
+}
+
+tl_kill() {
+  local s="$1" a
+  [ -n "$s" ] || { echo "usage: tlogs kill NAME"; tmux ls 2>/dev/null; exit 1; }
+  tmux has-session -t "=$s" 2>/dev/null || die "no session named exactly '$s'"
+  echo "Session '$s':"; tmux list-panes -s -t "=$s" -F '  #{pane_index}: #{pane_title}'
+  read -r -p "1/2 Close session '$s'? Log files are NOT touched. (y/N): " a; [ "$a" = y ] || { echo aborted; exit 1; }
+  read -r -p "2/2 Type the session name to confirm: " a; [ "$a" = "$s" ] || { echo "name mismatch - aborted"; exit 1; }
+  tmux kill-session -t "=$s" && echo "closed '$s'"
+  rm -f "${TMPDIR:-/tmp}/tlogs-$(id -u)/$s.conf" 2>/dev/null
+}
+
+tl_init() {
+  local d="${XDG_CONFIG_HOME:-$HOME/.config}/tlogs" f
+  f="$d/config"
+  if [ -e "$f" ]; then echo "$f already exists - left unchanged (edit it, or delete it and run tlogs init again)"; return 0; fi
+  mkdir -p "$d" || die "cannot create $d"
+  ( unset $TL_KEYS; tl_defaults; cat <<EOF
+# tlogs config - KEY=VALUE, one per line. Values are extended regex (grep -E).
+# Lines are coloured by the FIRST rule that matches: red, amber, yellow, green, blue, dim.
+# Empty value = rule off. This file is read as data, never executed.
+
+TL_GLOB='$TL_GLOB'
+TL_PREFIX=''
+TL_ICASE=$TL_ICASE
+TL_HIGHLIGHT=$TL_HIGHLIGHT
+
+# --- line colours ---
+TL_RED_RE='$TL_RED_RE'
+TL_AMBER_RE='$TL_AMBER_RE'
+TL_YELLOW_RE='$TL_YELLOW_RE'
+TL_GREEN_RE='$TL_GREEN_RE'
+TL_BLUE_RE='$TL_BLUE_RE'
+TL_DIM_RE='$TL_DIM_RE'
+
+# --- log state (for -r, -e, -w and pane labels) ---
+# DONE   = TL_OK_RE in the last TL_TAIL_LINES lines
+# WARN   = DONE, and TL_WARN_RE anywhere in the log
+# FAILED = TL_FAIL_RE in the last TL_TAIL_LINES lines
+# RUNNING = anything else
+TL_OK_RE='$TL_OK_RE'
+TL_WARN_RE='$TL_WARN_RE'
+TL_FAIL_RE='$TL_FAIL_RE'
+TL_TAIL_LINES=$TL_TAIL_LINES
+
+# --- watch mode (-w) ---
+TL_WATCH_SEC=$TL_WATCH_SEC
+TL_DONE_GRACE=$TL_DONE_GRACE
+TL_KEEP_DONE=$TL_KEEP_DONE
+
+# --- mouse: 1 = on for tlogs sessions only (your other tmux sessions are not changed) ---
+TL_MOUSE=$TL_MOUSE
+EOF
+  ) > "$f" && echo "wrote $f"
+}
+
+# ---------------------------------------------------------------- dispatch ---
+case "${1:-}" in
+  _pane)   shift; tl_pane "$@" ;;
+  _watch)  shift; tl_watch "$@" ;;
+  color|colour)
+    shift; tl_config
+    if [ -n "${1:-}" ]; then tail -n "$TL_HISTORY" -F "$1" | tl_colorize; else tl_colorize; fi ;;
+  ls)      tmux ls 2>/dev/null || echo "no tmux sessions" ;;
+  attach)  shift; [ -n "${1:-}" ] || { tmux ls 2>/dev/null; die "usage: tlogs attach NAME"; }
+           tmux has-session -t "=$1" 2>/dev/null || die "no session named exactly '$1'"; tl_attach "$1" ;;
+  kill)    shift; tl_kill "${1:-}" ;;
+  init)    tl_init ;;
+  config)  shift; tl_config "${1:-}"; tl_dump ;;
+  version|--version) echo "tlogs $TL_VERSION" ;;
+  help)    tl_config; usage ;;
+  *)       tl_main "$@" ;;
+esac
